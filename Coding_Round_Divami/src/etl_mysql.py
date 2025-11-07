@@ -1,14 +1,3 @@
-# src/etl_mysql.py
-"""
-Complete ETL pipeline (MySQL backend)
-- Reads CSVs from BASE / data / raw
-- Cleans data: schema validation, missing/negative checks, duplicates, outliers
-- Persists cleaned rows into MySQL staging table
-- Aggregates daily channel metrics and top-5 products
-- Writes CSV reports to BASE / reports and stores aggregates in MySQL reporting table
-- Writes invalid rows to BASE / errors
-- Ensures required tables exist (DDL)
-"""
 
 import logging
 from pathlib import Path
@@ -16,72 +5,55 @@ from datetime import datetime
 from urllib.parse import quote_plus
 import os
 from io import StringIO
+from typing import Optional, Tuple
 
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 from dotenv import load_dotenv
 
-# ---------------------------
-# CONFIG
-# ---------------------------
-BASE = Path(r"C:\Users\sreed\OneDrive\Desktop\Interview")  # adjust if needed
+# ----- Configuration -----
+BASE = Path(r"C:\Users\sreed\OneDrive\Desktop\Interview")
 RAW_DIR = BASE / "data" / "raw"
 REPORTS_DIR = BASE / "reports"
 ERRORS_DIR = BASE / "errors"
+for d in (RAW_DIR, REPORTS_DIR, ERRORS_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 
-# Ensure directories
-for p in (RAW_DIR, REPORTS_DIR, ERRORS_DIR):
-    p.mkdir(parents=True, exist_ok=True)
-
-# Load environment and DB creds
 load_dotenv(dotenv_path=BASE / ".env")
-MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
-MYSQL_PORT = os.getenv("MYSQL_PORT", "3306")
-MYSQL_USER = os.getenv("MYSQL_USER", "divami_user")
-MYSQL_PASS = os.getenv("MYSQL_PASS", "divami_pass")
-MYSQL_DB = os.getenv("MYSQL_DB", "divami_sales")
+DB_HOST = os.getenv("MYSQL_HOST", "localhost")
+DB_PORT = os.getenv("MYSQL_PORT", "3306")
+DB_USER = os.getenv("MYSQL_USER", "divami_user")
+DB_PASS = os.getenv("MYSQL_PASS", "divami_pass")
+DB_NAME = os.getenv("MYSQL_DB", "divami_sales")
 
-# SQLAlchemy DB URL using PyMySQL (works reliably in this environment)
-password_quoted = quote_plus(MYSQL_PASS)
-SQLALCHEMY_DATABASE_URL = f"mysql+pymysql://{MYSQL_USER}:{password_quoted}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}"
+DB_URL = f"mysql+pymysql://{DB_USER}:{quote_plus(DB_PASS)}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-REQUIRED_COLS = ["timestamp", "product_id", "channel", "quantity", "price_per_unit"]
+REQUIRED_COLUMNS = ["timestamp", "product_id", "channel", "quantity", "price_per_unit"]
+STAGING_COLUMNS = ["timestamp", "product_id", "channel", "quantity", "price_per_unit", "total_revenue", "date", "source_file"]
 
 
-# ---------------------------
-# DB helpers
-# ---------------------------
+# ----- DB helpers -----
 def get_engine():
+    """Create SQLAlchemy engine and smoke-test it."""
     try:
-        engine = create_engine(
-            SQLALCHEMY_DATABASE_URL,
-            pool_recycle=3600,
-            pool_pre_ping=True,
-            future=True,
-        )
-        # smoke test
+        engine = create_engine(DB_URL, pool_recycle=3600, pool_pre_ping=True, future=True)
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        logging.info("Connected to MySQL successfully.")
+        logging.info("DB OK")
         return engine
     except SQLAlchemyError:
-        logging.exception("Failed to create engine / connect to MySQL. Check credentials / DB availability.")
+        logging.exception("DB connection failed")
         raise
 
 
-def ensure_tables(engine):
-    """
-    Create staging and reporting tables if they don't exist.
-    Idempotent; safe to call on each run.
-    """
+def ensure_db_tables(engine):
+    """Create the DB and the two tables if missing (idempotent)."""
     ddl = f"""
-    CREATE DATABASE IF NOT EXISTS {MYSQL_DB};
-    USE {MYSQL_DB};
-
+    CREATE DATABASE IF NOT EXISTS {DB_NAME};
+    USE {DB_NAME};
     CREATE TABLE IF NOT EXISTS staging_sales (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       timestamp DATETIME NOT NULL,
@@ -94,7 +66,6 @@ def ensure_tables(engine):
       source_file VARCHAR(256),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
-
     CREATE TABLE IF NOT EXISTS reporting_daily_sales (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       report_date DATE NOT NULL,
@@ -105,77 +76,67 @@ def ensure_tables(engine):
       UNIQUE KEY uq_report_date_channel (report_date, channel)
     );
     """
-    try:
-        with engine.begin() as conn:
-            for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
-                conn.execute(text(stmt))
-        logging.info("Ensured required tables exist (staging_sales, reporting_daily_sales).")
-    except Exception:
-        logging.exception("Failed to ensure DDL tables.")
-        raise
+    with engine.begin() as conn:
+        for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
+            conn.execute(text(stmt))
+    logging.info("Ensured tables are present")
 
 
-# ---------------------------
-# CSV reading (robust)
-# ---------------------------
-def read_all_csvs(raw_dir: Path) -> pd.DataFrame:
-    """
-    Read all CSVs in raw_dir. Strips inline comments that start with '#'
-    (naive approach suitable for interview/demo CSVs).
-    """
+# ----- CSV reading & simple pre-processing -----
+def _strip_comments_from_text(text: str) -> str:
+  
+    out_lines = []
+    for line in text.splitlines():
+        if "#" in line:
+            line = line.split("#", 1)[0].rstrip()
+        if line:  # skip empty lines after stripping
+            out_lines.append(line)
+    return "\n".join(out_lines)
+
+
+def load_raw_csvs(raw_dir: Path) -> pd.DataFrame:
+    """Load all CSVs from raw_dir, add a source file column."""
     files = sorted(raw_dir.glob("*.csv"))
-    logging.info(f"Found {len(files)} CSV files in {raw_dir}")
-    dfs = []
+    logging.info(f"Found {len(files)} csv(s) in {raw_dir}")
+    frames = []
     for f in files:
         try:
-            # read as text and strip inline comments (after '#')
-            with open(f, "r", encoding="utf-8") as fh:
-                lines = []
-                for line in fh:
-                    if '#' in line:
-                        # remove content after first '#'
-                        line = line.split("#", 1)[0].rstrip() + "\n"
-                    lines.append(line)
-            cleaned_text = "".join(lines).strip()
-            if not cleaned_text:
-                logging.warning(f"{f.name} cleaned to empty content; skipping.")
+            raw = f.read_text(encoding="utf-8")
+            cleaned = _strip_comments_from_text(raw)
+            if not cleaned:
+                logging.warning(f"{f.name} empty after stripping comments; skipping")
                 continue
-            df = pd.read_csv(StringIO(cleaned_text))
+            df = pd.read_csv(StringIO(cleaned))
             df["_source_file"] = f.name
-            dfs.append(df)
-            logging.info(f"Loaded {f.name} -> {len(df)} rows (after cleaning comments)")
+            frames.append(df)
+            logging.info(f"Loaded {f.name} ({len(df)} rows)")
         except Exception:
-            logging.exception(f"Failed to read {f}")
-    if not dfs:
-        return pd.DataFrame(columns=REQUIRED_COLS + ["_source_file"])
-    combined = pd.concat(dfs, ignore_index=True)
-    return combined
+            logging.exception(f"Failed loading {f.name}")
+    if not frames:
+        return pd.DataFrame(columns=REQUIRED_COLUMNS + ["_source_file"])
+    return pd.concat(frames, ignore_index=True)
 
 
-# ---------------------------
-# Validation & Cleaning
-# ---------------------------
-def validate_columns(df: pd.DataFrame):
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+# ----- Cleaning -----
+def clean_records(df: pd.DataFrame) -> pd.DataFrame:
+    """Validate columns, coerce types, drop bad rows, remove outliers, compute totals."""
+    logging.info(f"Cleaning {len(df)} input rows")
+    # required schema
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
-    return True
 
+    # coercions
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
+    df["price_per_unit"] = pd.to_numeric(df["price_per_unit"], errors="coerce")
 
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
-    logging.info(f"Starting cleaning. Initial rows: {len(df)}")
-    # coerce types
-    df["timestamp"] = pd.to_datetime(df.get("timestamp"), errors="coerce")
-    df["quantity"] = pd.to_numeric(df.get("quantity"), errors="coerce")
-    df["price_per_unit"] = pd.to_numeric(df.get("price_per_unit"), errors="coerce")
-
-    # drop exact duplicates
-    before_dup = len(df)
+    # drop duplicates & obvious bads
+    before = len(df)
     df = df.drop_duplicates().reset_index(drop=True)
-    logging.info(f"Removed {before_dup - len(df)} duplicate rows")
+    logging.info(f"dropped {before - len(df)} duplicate rows")
 
-    # invalid mask
-    invalid_mask = (
+    bad_mask = (
         df["timestamp"].isna()
         | df["product_id"].isna()
         | df["channel"].isna()
@@ -184,114 +145,88 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
         | (df["quantity"] <= 0)
         | (df["price_per_unit"] < 0)
     )
+    bad = df[bad_mask].copy()
+    good = df[~bad_mask].copy()
 
-    invalid_rows = df[invalid_mask].copy()
-    valid_rows = df[~invalid_mask].copy()
+    if not bad.empty:
+        fn = ERRORS_DIR / f"invalid_rows_{datetime.utcnow():%Y%m%d_%H%M%S}.csv"
+        bad.to_csv(fn, index=False)
+        logging.warning(f"Wrote {len(bad)} invalid rows to {fn}")
 
-    # persist invalid rows for auditing
-    if not invalid_rows.empty:
-        err_file = ERRORS_DIR / f"invalid_rows_{datetime.utcnow():%Y%m%d_%H%M%S}.csv"
-        invalid_rows.to_csv(err_file, index=False)
-        logging.warning(f"Wrote {len(invalid_rows)} invalid rows to {err_file}")
-
-    # work on a real copy to avoid SettingWithCopyWarning
-    if not valid_rows.empty:
-        valid_rows = valid_rows.copy()
-    else:
-        logging.info("No valid rows after cleaning.")
-        return valid_rows
-
-    # remove extreme outliers using IQR on quantity if enough rows
-    if valid_rows["quantity"].notna().sum() >= 3:
-        q1 = valid_rows["quantity"].quantile(0.25)
-        q3 = valid_rows["quantity"].quantile(0.75)
+    # outlier removal on quantity (IQR)
+    if good["quantity"].notna().sum() >= 3:
+        q1 = good["quantity"].quantile(0.25)
+        q3 = good["quantity"].quantile(0.75)
         iqr = q3 - q1
         upper = q3 + 1.5 * iqr
-        before_out = len(valid_rows)
-        valid_rows = valid_rows[valid_rows["quantity"] <= upper].reset_index(drop=True)
-        logging.info(f"Removed {before_out - len(valid_rows)} outlier rows (quantity > {upper})")
-    else:
-        logging.info("Skipped outlier removal (not enough valid rows)")
+        before_out = len(good)
+        good = good[good["quantity"] <= upper].reset_index(drop=True)
+        logging.info(f"removed {before_out - len(good)} outlier(s) (quantity > {upper})")
 
     # derived fields
-    valid_rows["total_revenue"] = valid_rows["quantity"] * valid_rows["price_per_unit"]
-    valid_rows["date"] = valid_rows["timestamp"].dt.date
+    good = good.copy()
+    good["total_revenue"] = good["quantity"] * good["price_per_unit"]
+    good["date"] = good["timestamp"].dt.date
 
-    logging.info(f"Cleaning complete. Valid rows: {len(valid_rows)}")
-    return valid_rows
+    logging.info(f"Cleaning complete: {len(good)} valid rows")
+    return good
 
 
-# ---------------------------
-# Persist & Aggregate
-# ---------------------------
-def persist_staging_mysql(df: pd.DataFrame, engine):
-    """
-    Persist cleaned rows to staging_sales.
-    Ensures DataFrame column names match the DB schema (rename or drop unexpected cols).
-    Returns number of rows persisted.
-    """
+# ----- Persistence -----
+def write_staging(df: pd.DataFrame, engine) -> int:
+    """Write cleaned rows into staging_sales — rename/drop columns to match table schema."""
     if df.empty:
-        logging.info("No cleaned rows to persist to staging.")
+        logging.info("Nothing to write to staging")
         return 0
 
-    # make a defensive copy
     to_write = df.copy()
-
-    # rename _source_file -> source_file if present (this is the column created during CSV load)
-    if "_source_file" in to_write.columns and "source_file" not in to_write.columns:
+    # rename the field we added at read-time
+    if "_source_file" in to_write.columns:
         to_write = to_write.rename(columns={"_source_file": "source_file"})
-        logging.info("Renamed column _source_file -> source_file to match DB schema.")
+        logging.info("Renamed _source_file -> source_file")
 
-    # Drop any columns that are not in the DB schema (safe whitelist)
-    allowed = {"timestamp", "product_id", "channel", "quantity", "price_per_unit", "total_revenue", "date", "source_file"}
-    extra_cols = [c for c in to_write.columns if c not in allowed]
-    if extra_cols:
-        logging.info(f"Dropping extra columns before DB persist: {extra_cols}")
-        to_write = to_write[[c for c in to_write.columns if c in allowed]]
+    # enforce columns we expect
+    allowed = set(STAGING_COLUMNS)
+    present = [c for c in to_write.columns if c in allowed]
+    to_write = to_write[present]
 
     try:
-        # append to staging_sales (table created in ensure_tables)
         to_write.to_sql(name="staging_sales", con=engine, if_exists="append", index=False, method="multi")
-        logging.info(f"Persisted {len(to_write)} rows to MySQL table 'staging_sales'")
+        logging.info(f"Wrote {len(to_write)} rows to staging_sales")
         return len(to_write)
     except Exception:
-        logging.exception("Failed to persist staging data to MySQL")
+        logging.exception("Failed writing to staging")
         raise
 
 
-# ---------------------------
-# AGGREGATE & WRITE REPORTS (CSV + MySQL reporting table)
-# ---------------------------
-def aggregate_and_store(engine, report_date=None):
+# ----- Aggregation & reporting -----
+def generate_reports(engine, report_date: Optional[datetime.date] = None) -> Optional[Tuple[str, str]]:
+    """Read from staging_sales, produce daily and top-5 reports, upsert aggregates to reporting table."""
     try:
         df = pd.read_sql_query("SELECT * FROM staging_sales", con=engine, parse_dates=["timestamp"])
     except Exception:
-        logging.exception("Failed to read staging_sales from MySQL")
+        logging.exception("Failed to read staging_sales")
         raise
 
     if df.empty:
-        logging.warning("staging_sales is empty; skipping aggregation")
+        logging.info("staging_sales empty — skipping report generation")
         return None
 
-    # ensure date column typed correctly (if read back as string)
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"]).dt.date
-    else:
-        df["date"] = pd.to_datetime(df["timestamp"]).dt.date
+    # normalize date column
+    df["date"] = pd.to_datetime(df.get("date", df["timestamp"])).dt.date
 
     if report_date is None:
         report_date = df["date"].max()
+    logging.info(f"Building reports for {report_date}")
 
-    logging.info(f"Aggregating for date: {report_date}")
-
-    # daily aggregates by channel
+    # daily metrics
     daily = (
         df[df["date"] == pd.to_datetime(report_date).date()]
         .groupby(["date", "channel"], as_index=False)
         .agg(total_sales=("quantity", "sum"), total_revenue=("total_revenue", "sum"))
     )
 
-    # top 5 products by quantity
+    # top 5 products
     top5 = (
         df[df["date"] == pd.to_datetime(report_date).date()]
         .groupby(["product_id"], as_index=False)
@@ -300,28 +235,22 @@ def aggregate_and_store(engine, report_date=None):
         .head(5)
     )
 
-    # write CSV reports locally (unchanged)
-    report_date_str = pd.to_datetime(report_date).date()
-    daily_file = REPORTS_DIR / f"daily_sales_{report_date_str}.csv"
-    top_file = REPORTS_DIR / f"top5_products_{report_date_str}.csv"
-    daily.to_csv(daily_file, index=False)
-    top5.to_csv(top_file, index=False)
-    logging.info(f"Wrote CSV reports: {daily_file}, {top_file}")
+    # write CSVs
+    date_str = pd.to_datetime(report_date).date()
+    daily_path = REPORTS_DIR / f"daily_sales_{date_str}.csv"
+    top5_path = REPORTS_DIR / f"top5_products_{date_str}.csv"
+    daily.to_csv(daily_path, index=False)
+    top5.to_csv(top5_path, index=False)
+    logging.info(f"Wrote reports: {daily_path.name}, {top5_path.name}")
 
-    # persist daily aggregates to MySQL reporting table
-    # rename 'date' -> 'report_date' to match DB column name
-    daily_db = daily.rename(columns={"date": "report_date"}).copy()
-
-    # ensure columns are exactly the expected ones (whitelist)
-    expected_cols = ["report_date", "channel", "total_sales", "total_revenue"]
-    extra = [c for c in daily_db.columns if c not in expected_cols]
-    if extra:
-        logging.info(f"Dropping unexpected cols before writing aggregates: {extra}")
-        daily_db = daily_db[[c for c in daily_db.columns if c in expected_cols]]
+    # upsert aggregates into reporting_daily_sales
+    daily_upsert = daily.rename(columns={"date": "report_date"}).copy()
+    expected = ["report_date", "channel", "total_sales", "total_revenue"]
+    daily_upsert = daily_upsert[[c for c in expected if c in daily_upsert.columns]]
 
     try:
         with engine.begin() as conn:
-            for _, row in daily_db.iterrows():
+            for _, row in daily_upsert.iterrows():
                 conn.execute(text(
                     """
                     INSERT INTO reporting_daily_sales (report_date, channel, total_sales, total_revenue)
@@ -337,69 +266,52 @@ def aggregate_and_store(engine, report_date=None):
                     "total_sales": int(row["total_sales"]),
                     "total_revenue": float(row["total_revenue"]),
                 })
-        logging.info("Saved daily aggregates to MySQL table 'reporting_daily_sales' (upserted)")
+        logging.info("Upserted daily aggregates to reporting_daily_sales")
     except Exception:
-        logging.exception("Failed to persist reporting_daily_sales to MySQL")
+        logging.exception("Failed to upsert aggregates")
         raise
 
-    return str(daily_file), str(top_file)
+    return str(daily_path), str(top5_path)
 
 
-# ---------------------------
-# Main
-# ---------------------------
+# ----- Main flow -----
 def main():
-    logging.info("=== ETL (MySQL) started ===")
-
-    # Read
-    df_raw = read_all_csvs(RAW_DIR)
-    if df_raw.empty:
-        logging.warning("No input files found in raw directory. Exiting.")
+    logging.info("ETL started")
+    raw = load_raw_csvs(RAW_DIR)
+    if raw.empty:
+        logging.warning("No input files - exiting")
         return
 
-    # Validate
     try:
-        validate_columns(df_raw)
-    except ValueError:
-        logging.exception("Schema validation failed - aborting ETL.")
+        valid = clean_records(raw)
+    except Exception:
+        logging.exception("Cleaning failed - aborting")
         return
 
-    # Clean
-    df_clean = clean_data(df_raw)
-
-    # DB connect
     try:
         engine = get_engine()
     except Exception:
-        logging.error("Cannot proceed without DB connection.")
         return
 
-    # Ensure tables exist (safe)
     try:
-        ensure_tables(engine)
+        ensure_db_tables(engine)
     except Exception:
-        logging.error("Cannot ensure DB tables; aborting.")
         return
 
-    # Persist staging
     try:
-        persisted = persist_staging_mysql(df_clean, engine)
+        count = write_staging(valid, engine)
     except Exception:
-        logging.error("Persist to staging failed; aborting.")
+        logging.error("Failed writing staging - abort")
         return
 
-    # Aggregate & reports for the latest date in this batch
-    if persisted and not df_clean.empty:
-        latest = df_clean["date"].max()
+    if count:
         try:
-            aggregate_and_store(engine, report_date=latest)
+            generate_reports(engine, report_date=valid["date"].max())
         except Exception:
-            logging.error("Aggregation/reporting failed.")
+            logging.error("Report generation failed")
             return
-    else:
-        logging.info("No rows persisted; skipping aggregation.")
 
-    logging.info("=== ETL (MySQL) completed ===")
+    logging.info("ETL completed")
 
 
 if __name__ == "__main__":
