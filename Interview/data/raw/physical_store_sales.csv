@@ -1,8 +1,0 @@
-timestamp,product_id,channel,quantity,price_per_unit
-9/12/2025 10:00,P321,physical_store,3,150
-9/12/2025 10:10,P654,physical_store,5,120
-9/12/2025 10:20,P321,physical_store,0,200
-9/12/2025 10:30,P999,physical_store,8,180
-9/12/2025 10:35,P999,physical_store,8,180
-9/12/2025 10:40,P222,physical_store,7,
-9/12/2025 10:50,P333,physical_store,12,abc

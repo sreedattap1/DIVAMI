@@ -1,9 +1,0 @@
-timestamp,product_id,channel,quantity,price_per_unit,_source_file
-2025-09-12 09:20:00,P999,mobile_app,,300.0,mobile_app_sales.csv
-2025-09-12 09:30:00,P111,mobile_app,3.0,-50.0,mobile_app_sales.csv
-2025-09-12 10:20:00,P321,physical_store,0.0,200.0,physical_store_sales.csv
-2025-09-12 10:40:00,P222,physical_store,7.0,,physical_store_sales.csv
-2025-09-12 10:50:00,P333,physical_store,12.0,,physical_store_sales.csv
-2025-09-12 09:15:00,,web_app,3.0,400.0,web_app_sales.csv
-2025-09-12 09:20:00,P789 ,web_app,-2.0,150.0,web_app_sales.csv
-2025-09-12 09:30:00,P666,web_app,4.0,,web_app_sales.csv

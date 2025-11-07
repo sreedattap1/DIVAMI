@@ -1,7 +1,0 @@
-timestamp,product_id,channel,quantity,price_per_unit
-9/12/2025 9:00,P777,mobile_app,1,500
-9/12/2025 9:10,P888,mobile_app,2,200
-9/12/2025 9:20,P999,mobile_app,,300
-9/12/2025 9:30,P111,mobile_app,3,-50
-9/12/2025 9:40,P999,mobile_app,2,300
-9/12/2025 9:40,P999,mobile_app,2,300
