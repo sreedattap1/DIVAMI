@@ -60,18 +60,29 @@ This pattern is common in production ETL setups and allows incremental updates.
 ________________________________________
 Folder Structure
 Interview/
+
 .env
+
 data/raw/         -> Source CSVs
+
 errors/           -> Invalid or rejected rows
+
 reports/          -> Output reports
+
 src/etl_mysql.py  -> Main ETL script
 ________________________________________
 LOG Main lines
 INFO | Found 3 CSV files in raw folder
+
 INFO | Removed 1 duplicate row
+
+
 INFO | Wrote 8 invalid rows to errors/
+
 INFO | Connected to MySQL successfully
+
 INFO | Persisted 10 rows to staging_sales
+
 INFO | Wrote reports: daily_sales_2025-09-12.csv, top5_products_2025-09-12.csv
 ________________________________________
 What Can be done more 
